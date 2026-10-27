@@ -1,0 +1,95 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # A workflow that fails to parse reports nothing at all; actionlint is the
+  # only thing that catches it, so it is the first lane.
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  test:
+    name: build + vet + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go version
+      - name: gofmt
+        run: |
+          drift=$(gofmt -l .)
+          if [ -n "$drift" ]; then echo "::error::not gofmt-clean:"; echo "$drift"; exit 1; fi
+      - name: build
+        run: CGO_ENABLED=0 go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: vet for windows, darwin, js/wasm, 386
+        run: |
+          GOOS=windows go vet ./...
+          GOOS=darwin go vet ./...
+          GOOS=js GOARCH=wasm go vet ./...
+          GOARCH=386 go vet ./...
+      # Every statement is covered; the test that builds real wasm (clean
+      # and dirty) runs here, not only locally.
+      - name: test, every statement covered
+        run: |
+          go test -race -timeout 10m -coverprofile=cov.out ./...
+          go run github.com/go-fleettools/fleettools/cmd/covblocks@v0.40.0 cov.out
+      - name: fuzz smoke
+        run: go test -run '^$' -fuzz FuzzRead -fuzztime 30s .
+      - name: govulncheck, judged by vulngate
+        run: |
+          set -eu
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install github.com/go-fleettools/fleettools/cmd/vulngate@v0.20.1
+          "$(go env GOPATH)/bin/govulncheck" -format json ./... > /tmp/vuln.json || true
+          test -s /tmp/vuln.json || { echo "::error::govulncheck wrote nothing at all"; exit 1; }
+          "$(go env GOPATH)/bin/vulngate" -go "$(go env GOVERSION)" /tmp/vuln.json
+
+  # The tool judges other builds; this lane points it at its own, both ways.
+  self:
+    name: buildstamp judges itself
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go version
+      - name: a build of this commit, outside the checkout, is clean
+        run: |
+          set -eu
+          GOOS=js GOARCH=wasm go build -o "$RUNNER_TEMP/self.wasm" ./cmd/buildstamp
+          go run ./cmd/buildstamp check --revision "$(git rev-parse HEAD)" "$RUNNER_TEMP/self.wasm"
+      - name: and one built after writing into the checkout is not
+        run: |
+          set -eu
+          # The planted positive: the exact defect this tool was written for
+          # (an output directory inside the work tree, go-wasmcontainers/dashboard
+          # v0.4.2). Exit status 1 is required.
+          mkdir _site && echo x > _site/index.html
+          GOOS=js GOARCH=wasm go build -o "$RUNNER_TEMP/dirty.wasm" ./cmd/buildstamp
+          set +e
+          go run ./cmd/buildstamp check "$RUNNER_TEMP/dirty.wasm"
+          status=$?
+          set -e
+          if [ "$status" -ne 1 ]; then echo "::error::a dirty build was judged with status $status, want 1"; exit 1; fi
+          echo "the planted dirty build was refused, as it must be"
